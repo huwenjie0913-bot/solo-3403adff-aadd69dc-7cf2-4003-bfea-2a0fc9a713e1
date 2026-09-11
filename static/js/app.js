@@ -244,6 +244,8 @@
         yLabel: "dB",
       });
     }
+    // tuning-step overlay (set by tune.js when a step is selected)
+    if (S._respOverlay) series.push(S._respOverlay);
     response.setSeries(series);
   }
 
@@ -392,6 +394,7 @@
     S.cursorF = S.f0;
     analyze();
     renderCandidates();
+    if (window.TuneUI) TuneUI.refreshPair();
     toast("已载入: " + c.name);
   }
 
@@ -516,6 +519,7 @@
       };
       box.appendChild(row);
     });
+    if (window.TuneUI) TuneUI.refreshVersions();
   }
 
   async function openVersion(id) {
@@ -534,6 +538,7 @@
       segments: d.segments, flags: d.flags || [], score: d.score,
     };
     analyze();
+    if (window.TuneUI) TuneUI.refreshPair();
     toast("已载入版本 #" + id);
   }
 
@@ -633,4 +638,12 @@
   readSetup();
   loadVersions();
   renderAll();
+
+  // bridge for tune.js (live tuning path planner)
+  window.App = {
+    S, readSetup, denseGrid, recomputeFeed, analyze, renderResponse,
+    setCursor, toast, parseVal, loadVersions,
+    get responseOverlay() { return S._respOverlay; },
+    set responseOverlay(v) { S._respOverlay = v; },
+  };
 })();

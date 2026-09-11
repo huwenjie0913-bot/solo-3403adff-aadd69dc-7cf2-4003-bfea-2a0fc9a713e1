@@ -9,7 +9,7 @@
 <body>
 <header>
   <h1>📡 天线匹配网络设计器</h1>
-  <span class="sub">Smith 圆图 · L / Π / T / 短截线 · 候选搜索与版本管理</span>
+  <span class="sub">Smith 圆图 · L / Π / T / 短截线 · 候选搜索与版本管理 · 带电调谐路径</span>
   <span class="spacer"></span>
   <button class="ghost small" id="btnSample">载入示例</button>
   <button class="ghost small" id="btnVersions">已存版本</button>
@@ -78,6 +78,24 @@
       <button id="btnSearch" style="width:100%;margin-top:8px">🔍 搜索候选网络</button>
       <div id="searchInfo" class="muted" style="margin-top:6px;font-size:11px"></div>
     </div>
+
+    <div class="panel">
+      <h2>4 · 带电调谐路径规划</h2>
+      <div class="row"><label>起点方案</label><select id="tuneFrom"></select></div>
+      <div class="row"><label>目标方案</label><select id="tuneTo"></select></div>
+      <div id="tunePairInfo" class="muted" style="font-size:11px;margin-bottom:6px">
+        选择拓扑与元件编号一致的两个方案</div>
+      <div id="tuneSteps"></div>
+      <div class="grid2" style="margin-top:6px">
+        <div class="row"><label>调谐功率</label><input id="tunePower" type="number" value="10" title="W"></div>
+        <div class="row"><label>SWR ≤</label><input id="tuneSwr" type="number" step="0.1" value="3"></div>
+        <div class="row"><label>电压 V</label><input id="tuneV" type="number" value="500"></div>
+        <div class="row"><label>电流 A</label><input id="tuneI" type="number" value="3"></div>
+        <div class="row"><label>损耗 dB</label><input id="tuneLoss" type="number" step="0.1" value="3"></div>
+      </div>
+      <button id="btnTunePlan" style="width:100%;margin-top:8px">🧭 规划安全调谐路径</button>
+      <div id="tuneInfo" class="muted" style="margin-top:6px;font-size:11px"></div>
+    </div>
   </div>
 
   <!-- ================= CENTER: visualisation ================= -->
@@ -104,6 +122,21 @@
         <div class="tab" data-metric="loss">总损耗</div>
       </div>
       <svg id="response" width="100%" viewBox="0 0 760 220"></svg>
+    </div>
+
+    <div class="panel">
+      <h2>调谐步骤轨道（点击步骤查看当时电路与频响）</h2>
+      <div class="row" style="margin-bottom:6px">
+        <button class="ghost small" id="btnTuneRecheck">复算序列</button>
+        <button class="ghost small" id="btnTuneReplan" title="保留📌固定的前缀步骤，重新规划其余">保留📌重规划</button>
+        <span class="spacer"></span>
+        <button class="ghost small" id="btnTuneSave">保存路径</button>
+        <button class="ghost small" id="btnTuneCard">导出调谐卡</button>
+        <button class="ghost small" id="btnTuneJson">导出 JSON</button>
+      </div>
+      <div id="tuneTrack" class="track"><span class="muted">尚未规划</span></div>
+      <div id="tuneDetail" class="tune-detail"></div>
+      <div id="tunePaths"></div>
     </div>
 
     <div class="panel">
@@ -177,5 +210,6 @@
 <script src="js/response.js"></script>
 <script src="js/exporters.js"></script>
 <script src="js/app.js"></script>
+<script src="js/tune.js"></script>
 </body>
 </html>

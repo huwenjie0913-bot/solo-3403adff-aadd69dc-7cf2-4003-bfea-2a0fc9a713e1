@@ -12,6 +12,7 @@ import numpy as np
 from flask import Flask, jsonify, request, send_from_directory
 
 import db as dbmod
+import tune as tunemod
 from rf import feedline_input
 from search import TOPOS, search_candidates
 
@@ -201,6 +202,88 @@ def api_version(vid):
 @app.route("/")
 def index():
     return send_from_directory("static", "index.html")
+
+
+# --------------------------------------------------------------------------
+# Live tuning path planning
+# --------------------------------------------------------------------------
+
+def _tune_ctx(d):
+    """Shared planning/check context from a request payload."""
+    f = np.asarray(d["freq"], dtype=float)
+    zl = np.array([complex(a, b) for a, b in d["zload"]], dtype=complex)
+    return tunemod.make_context(
+        f, zl, d["segments"], d["setup"],
+        z0=float(d.get("z0", 50.0)),
+        flow=float(d["flow"]), fhigh=float(d["fhigh"]),
+        power=float(d.get("power", 10.0)),
+        limits=d.get("limits") or {},
+        ngrid=int(d.get("ngrid", 301)),
+    )
+
+
+@app.route("/api/tune/plan", methods=["POST"])
+def api_tune_plan():
+    d = request.json or {}
+    try:
+        ctx = _tune_ctx(d)
+        res = tunemod.plan(
+            ctx, d["current"], d["target"],
+            d.get("steps") or {}, links=d.get("links") or [],
+            prefix=d.get("prefix"),
+            max_states=int(d.get("max_states", 40000)),
+        )
+        return jsonify(res)
+    except (KeyError, ValueError) as e:
+        return jsonify({"error": f"参数错误: {e}"}), 400
+    except Exception as e:  # noqa: BLE001
+        app.logger.exception("tune plan failed")
+        return jsonify({"error": f"规划失败: {e}"}), 500
+
+
+@app.route("/api/tune/check", methods=["POST"])
+def api_tune_check():
+    d = request.json or {}
+    try:
+        ctx = _tune_ctx(d)
+        steps, final, _power = tunemod.check_actions(
+            ctx, d["start"], d.get("actions") or [],
+            dials=d.get("dials"))
+        ok = not any(s["violations"] for s in steps)
+        return jsonify({"ok": ok, "steps": steps, "final_values": final})
+    except (KeyError, ValueError) as e:
+        return jsonify({"error": f"参数错误: {e}"}), 400
+    except Exception as e:  # noqa: BLE001
+        app.logger.exception("tune check failed")
+        return jsonify({"error": f"复算失败: {e}"}), 500
+
+
+@app.route("/api/tune/paths", methods=["GET", "POST"])
+def api_tune_paths():
+    if request.method == "POST":
+        d = request.json or {}
+        if not d.get("target_version_id"):
+            return jsonify({"error": "路径必须关联到一个已存目标方案"}), 400
+        pid = dbmod.save_tune_path(
+            d.get("name", "未命名路径"),
+            int(d["target_version_id"]),
+            d.get("note", ""),
+            d.get("data", {}),
+        )
+        return jsonify({"id": pid})
+    vid = request.args.get("version_id", type=int)
+    return jsonify({"paths": dbmod.list_tune_paths(vid)})
+
+
+@app.route("/api/tune/paths/<int:pid>", methods=["GET", "DELETE"])
+def api_tune_path(pid):
+    if request.method == "DELETE":
+        dbmod.delete_tune_path(pid)
+        return jsonify({"ok": True})
+    p = dbmod.get_tune_path(pid)
+    if p is None:
+        return jsonify({"error": "not found"}), 404
+    return jsonify(p)
 
 
 if __name__ == "__main__":
