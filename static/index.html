@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>天线匹配网络设计器</title>
+<link rel="stylesheet" href="css/app.css">
+</head>
+<body>
+<header>
+  <h1>📡 天线匹配网络设计器</h1>
+  <span class="sub">Smith 圆图 · L / Π / T / 短截线 · 候选搜索与版本管理</span>
+  <span class="spacer"></span>
+  <button class="ghost small" id="btnSample">载入示例</button>
+  <button class="ghost small" id="btnVersions">已存版本</button>
+</header>
+
+<div class="layout">
+  <!-- ================= LEFT: inputs ================= -->
+  <div class="col-left">
+    <div class="panel">
+      <h2>1 · 频率—复阻抗数据</h2>
+      <textarea id="csvInput" placeholder="freq_MHz,R,X&#10;3.50,18.2,-80&#10;...&#10;支持两列(复阻抗 42-18j)或三列；MHz/Hz 自动识别"></textarea>
+      <div class="row" style="margin-top:8px">
+        <button id="btnParse" class="small">解析 CSV</button>
+        <span id="parseInfo" class="muted"></span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>2 · 系统与馈线</h2>
+      <div class="grid2">
+        <div class="row"><label>系统 Z0</label><input id="z0" type="number" value="50"></div>
+        <div class="row"><label>功率 W</label><input id="power" type="number" value="100"></div>
+      </div>
+      <div class="grid2">
+        <div class="row"><label>馈线 Z0</label><input id="zline" type="number" value="50"></div>
+        <div class="row"><label>速比 vf</label><input id="vf" type="number" step="0.01" value="0.83"></div>
+      </div>
+      <div class="grid2">
+        <div class="row"><label>长度 m</label><input id="lineLen" type="number" step="0.1" value="0"></div>
+        <div class="row"><label>损耗</label><input id="lineLoss" type="number" step="0.1" value="0" title="dB/100m"></div>
+      </div>
+      <div class="grid2">
+        <div class="row"><label>起 MHz</label><input id="flow" type="number" step="0.001" value="3.5"></div>
+        <div class="row"><label>止 MHz</label><input id="fhigh" type="number" step="0.001" value="3.8"></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>3 · 拓扑与元件限制</h2>
+      <div class="chips" id="famChips" style="margin-bottom:8px">
+        <span class="chip on" data-fam="L">L 型</span>
+        <span class="chip on" data-fam="Pi">Π 型</span>
+        <span class="chip on" data-fam="T">T 型</span>
+        <span class="chip on" data-fam="stub">短截线</span>
+      </div>
+      <div class="grid2">
+        <div class="row"><label>L min</label><input id="lmin" value="10 nH"></div>
+        <div class="row"><label>L max</label><input id="lmax" value="100 uH"></div>
+        <div class="row"><label>C min</label><input id="cmin" value="1 pF"></div>
+        <div class="row"><label>C max</label><input id="cmax" value="10 uF"></div>
+        <div class="row"><label>线 min</label><input id="llenmin" value="2 cm"></div>
+        <div class="row"><label>线 max</label><input id="llenmax" value="40 m"></div>
+      </div>
+      <div class="grid2" style="margin-top:6px">
+        <div class="row"><label>耐压 V</label><input id="vrate" type="number" value="500"></div>
+        <div class="row"><label>电流 A</label><input id="irate" type="number" value="5"></div>
+      </div>
+      <div class="grid2">
+        <div class="row"><label>Q 电感</label><input id="qL" type="number" value="200"></div>
+        <div class="row"><label>Q 电容</label><input id="qC" type="number" value="1000"></div>
+      </div>
+      <div class="grid2">
+        <div class="row"><label>目标 SWR</label><input id="swrTarget" type="number" step="0.1" value="1.5"></div>
+        <div class="row"><label>短截 Z0</label><input id="zstub" type="number" value="50"></div>
+      </div>
+      <button id="btnSearch" style="width:100%;margin-top:8px">🔍 搜索候选网络</button>
+      <div id="searchInfo" class="muted" style="margin-top:6px;font-size:11px"></div>
+    </div>
+  </div>
+
+  <!-- ================= CENTER: visualisation ================= -->
+  <div class="col-center">
+    <div class="panel">
+      <h2>匹配电路（拖动手柄或滚轮改变元件；拖动实时更新）</h2>
+      <svg id="schematic" width="100%" viewBox="0 0 760 300"></svg>
+      <div class="row" style="margin-top:4px">
+        <div class="legend2">
+          <span><i style="background:var(--match)"></i>拖动调节</span>
+          <span class="muted">← 源侧 &nbsp; 负载侧 →</span>
+        </div>
+        <span class="spacer"></span>
+        <button class="ghost small" id="btnSvg">导出电路 SVG</button>
+        <button class="ghost small" id="btnBom">导出物料表</button>
+        <button class="ghost small" id="btnJson">导出逐频点 JSON</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="tabs">
+        <div class="tab on" data-metric="swr">驻波比 SWR</div>
+        <div class="tab" data-metric="rl">回波损耗 RL</div>
+        <div class="tab" data-metric="loss">总损耗</div>
+      </div>
+      <svg id="response" width="100%" viewBox="0 0 760 220"></svg>
+    </div>
+
+    <div class="panel">
+      <h2>候选网络（点击载入；标签为问题，点击标签定位频点）</h2>
+      <div class="scroll">
+        <table class="cand">
+          <thead><tr>
+            <th>#</th><th>拓扑</th><th>SWRmax</th><th>带宽</th>
+            <th>损耗</th><th>问题</th>
+          </tr></thead>
+          <tbody id="candBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <!-- ================= RIGHT: analysis ================= -->
+  <div class="col-right">
+    <div class="panel">
+      <h2>Smith 圆图</h2>
+      <svg id="smith" width="100%" viewBox="0 0 460 460"></svg>
+      <div class="legend2" style="margin-top:4px">
+        <span><i style="background:var(--load)"></i>负载</span>
+        <span><i style="background:var(--feed)"></i>馈线变换</span>
+        <span><i style="background:var(--match)"></i>匹配后</span>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>@ <span id="curFreq">—</span> MHz 指标</h2>
+      <div class="metrics">
+        <div class="metric"><div class="k">驻波比</div><div class="v" id="mSWR">—</div></div>
+        <div class="metric"><div class="k">回波损耗</div><div class="v" id="mRL">—</div></div>
+        <div class="metric"><div class="k">估算损耗</div><div class="v" id="mLoss">—</div></div>
+        <div class="metric"><div class="k">失配损耗</div><div class="v" id="mMism">—</div></div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2>元件电流 / 电压 / 耗散</h2>
+      <table class="stress-table" id="stressTable">
+        <thead><tr><th>元件</th><th>电压 V</th><th>电流 A</th><th>耗散 W</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+
+    <div class="panel">
+      <h2>问题定位</h2>
+      <div id="flagList" class="muted">无</div>
+    </div>
+
+    <div class="panel">
+      <h2>方案版本</h2>
+      <div class="row"><input id="verName" placeholder="版本名称，如 80m-LCC-v2"></div>
+      <div class="row">
+        <button id="btnSave" class="small">保存版本</button>
+        <button id="btnCompare" class="ghost small">比较已选</button>
+      </div>
+      <div id="verList" class="versions scroll"></div>
+      <div id="cmpOut" class="muted" style="font-size:11px;margin-top:6px"></div>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="js/rf.js"></script>
+<script src="js/topologies.js"></script>
+<script src="js/smith.js"></script>
+<script src="js/schematic.js"></script>
+<script src="js/response.js"></script>
+<script src="js/exporters.js"></script>
+<script src="js/app.js"></script>
+</body>
+</html>

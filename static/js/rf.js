@@ -30,7 +30,7 @@
       const a0 = lossDb100m / (100 * 8.685889638);
       const alpha = a0 * Math.sqrt(f / (fmed || 1));
       const th = { re: alpha * len, im: beta * len }; // gamma*l = alpha*l + j beta*l
-      const t = ctan(th);
+      const t = ctanh(th);
       const z = zloadArr[i];
       const num = cadd(z, cmul({ re: z0c, im: 0 }, t));
       const den = cadd({ re: z0c, im: 0 }, cmul(z, t));
@@ -38,11 +38,15 @@
     });
   }
 
-  function ctan(z) {
-    // tan(x+jy)
+  function ctanh(z) {
+    // tanh(x+jy) = (sinh 2x + j sin 2y) / (cosh 2x + cos 2y)
     const a = 2 * z.re, b = 2 * z.im;
-    const d = Math.cos(a) + Math.cosh(b);
-    return { re: Math.sin(a) / d, im: Math.sinh(b) / d };
+    const den = Math.cosh(a) + Math.cos(b);
+    if (Math.abs(den) < 1e-12) {
+      // singular (e.g. lossless quarter-wave): return a large pure-j value
+      return { re: 0, im: Math.sign(Math.sin(b)) * 1e12 };
+    }
+    return { re: Math.sinh(a) / den, im: Math.sin(b) / den };
   }
 
   function lineInput(z, z0c, theta) {
@@ -84,12 +88,14 @@
   function evaluate(freq, zload, segments, z0, power = 1) {
     const n = freq.length;
     const w = freq.map(f => 2 * Math.PI * f);
-    const before = [];
-    let z = zload.map(x => ({ ...x }));
 
-    for (const seg of segments) {
-      before.push(z.map(x => ({ ...x })));
-      z = z.map((zz, i) => stepBack(zz, seg, w[i], freq[i]));
+    // backward pass: impedance looking into the network at each node
+    let z = zload.map(x => ({ ...x }));
+    const zAfter = new Array(segments.length);
+    for (let i = segments.length - 1; i >= 0; i--) {
+      const seg = segments[i];
+      zAfter[i] = z.map(x => ({ ...x }));
+      z = z.map((zz, k) => stepBack(zz, seg, w[k], freq[k]));
     }
     const zin = z;
 
@@ -106,41 +112,45 @@
     }
 
     const vth = 2 * Math.sqrt(Math.max(power, 0) * z0);
-    let v = zin.map(zz =>
-      cmul({ re: vth, im: 0 }, cdiv(zz, cadd(zz, { re: z0, im: 0 }))));
+    const iIn0 = zin.map(zz =>
+      cdiv({ re: vth, im: 0 }, cadd(zz, { re: z0, im: 0 })));
+    let vline = zin.map((zz, i) =>
+      csub({ re: vth, im: 0 }, cmul({ re: z0, im: 0 }, iIn0[i])));
+    let iline = iIn0.slice();
     const comps = {};
     const pDiss = new Array(n).fill(0);
 
     segments.forEach((seg, si) => {
       const vrms = new Array(n), irms = new Array(n), pd = new Array(n);
       for (let i = 0; i < n; i++) {
-        const zb = before[si][i];
+        const za = zAfter[si][i];
         if (seg.etype === "L" || seg.etype === "C") {
           const zs = segZ(seg, w[i]);
           if (seg.kind === "series") {
-            const iline = cdiv(v[i], zb);
-            const vc = cmul(iline, zs);
+            const vc = cmul(iline[i], zs);
             vrms[i] = cabs(vc);
-            irms[i] = cabs(iline);
-            pd[i] = seg.q ? irms[i] ** 2 * zs.re : 0;
-            v[i] = csub(v[i], vc);
+            irms[i] = cabs(iline[i]);
+            pd[i] = irms[i] ** 2 * zs.re;
+            vline[i] = csub(vline[i], vc);
           } else {
-            const ish = cmul(v[i], cdiv({ re: 1, im: 0 }, zs));
-            vrms[i] = cabs(v[i]);
+            const vsh = cmul(iline[i], za);
+            const ish = cdiv(vsh, zs);
+            vrms[i] = cabs(vsh);
             irms[i] = cabs(ish);
             if (seg.q) {
               const rp = seg.q * Math.max(Math.abs(zs.im), 1e-12);
               pd[i] = vrms[i] ** 2 / rp;
             } else pd[i] = 0;
+            iline[i] = csub(iline[i], ish);
+            vline[i] = vsh;
           }
         } else {
           const th = segTheta(seg, freq[i]);
           if (seg.kind === "series") {
-            const za = lineInputInv(zb, seg.z0, th);
             const denom = cadd(
               { re: Math.cos(th), im: 0 },
               cdiv({ re: 0, im: seg.z0 * Math.sin(th) }, za));
-            const va = cdiv(v[i], denom);
+            const va = cdiv(vline[i], denom);
             const gl = cdiv(csub(za, { re: seg.z0, im: 0 }),
               cadd(za, { re: seg.z0, im: 0 }));
             const vplus = cabs(cdiv(va, cadd({ re: 1, im: 0 }, gl)));
@@ -148,13 +158,17 @@
             vrms[i] = vplus * (1 + rho);
             irms[i] = vplus / seg.z0 * (1 + rho);
             pd[i] = 0;
-            v[i] = va;
+            vline[i] = va;
+            iline[i] = cdiv(va, za);
           } else {
+            const vsh = cmul(iline[i], za);
             const ys = stubY(seg.z0, th, seg.termin);
-            const ish = cmul(v[i], ys);
-            vrms[i] = cabs(v[i]);
+            const ish = cmul(vsh, ys);
+            vrms[i] = cabs(vsh);
             irms[i] = cabs(ish);
             pd[i] = 0;
+            iline[i] = csub(iline[i], ish);
+            vline[i] = vsh;
           }
         }
         pDiss[i] += pd[i];
@@ -165,9 +179,9 @@
     const loss = new Array(n), diss = new Array(n), eta = new Array(n),
       pIn = new Array(n);
     for (let i = 0; i < n; i++) {
-      const iin = cdiv({ re: vth, im: 0 },
-        cadd(zin[i], { re: z0, im: 0 }));
-      pIn[i] = (v[i].re * iin.re + v[i].im * iin.im);
+      const vIn = csub({ re: vth, im: 0 },
+        cmul({ re: z0, im: 0 }, iIn0[i]));
+      pIn[i] = vIn.re * iIn0[i].re + vIn.im * iIn0[i].im;
       const pl = Math.max(pIn[i] - pDiss[i], 1e-30);
       eta[i] = Math.min(1, Math.max(0, pl / Math.max(pIn[i], 1e-30)));
       diss[i] = -10 * Math.log10(Math.max(eta[i], 1e-12));

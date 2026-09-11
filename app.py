@@ -162,7 +162,7 @@ def api_search():
 def api_feedline():
     d = request.json or {}
     f = np.asarray(d["freq"], dtype=float)
-    zl = np.asarray(d["zload"], dtype=complex)
+    zl = np.array([complex(a, b) for a, b in d["zload"]], dtype=complex)
     s = d["setup"]
     z = feedline_input(zl, f, s["zline"], s["line_len"], s["vf"],
                        s.get("line_loss", 0.0))

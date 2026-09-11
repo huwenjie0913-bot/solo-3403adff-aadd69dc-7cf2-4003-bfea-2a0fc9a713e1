@@ -73,10 +73,10 @@ def _seg_impedance(seg, w):
     if t == "L":
         x = w * seg["val"]
         return (x / q if q else 0.0) + 1j * x
-    # capacitor, series resistance model
+    # capacitor, series resistance (ESR) model: R + 1/(jwC) = R - j/(wC)
     xc = -1.0 / (w * seg["val"])
     r = abs(xc) / q if q else 0.0
-    return r + xc
+    return r + 1j * xc
 
 
 # --------------------------------------------------------------------------
@@ -96,13 +96,17 @@ def evaluate(freq, zload, segments, z0, power=1.0):
     """
     f = np.asarray(freq, dtype=float)
     w = 2.0 * np.pi * f
+    # Backward pass: segments are listed source -> load, so impedances
+    # looking into the network are accumulated from the load end.
+    # z_after[i] = impedance seen at segment i's load-side port.
     z = np.asarray(zload, dtype=complex).copy()
     if z.shape != f.shape:
         z = np.broadcast_to(z, f.shape).astype(complex)
 
-    before = []
-    for seg in segments:
-        before.append(z.copy())
+    z_after = [None] * len(segments)
+    for i in range(len(segments) - 1, -1, -1):
+        seg = segments[i]
+        z_after[i] = z.copy()
         kind, et = seg["kind"], seg["etype"]
         if et in ("L", "C"):
             zs = _seg_impedance(seg, w)
@@ -112,9 +116,8 @@ def evaluate(freq, zload, segments, z0, power=1.0):
                 z = 1.0 / (1.0 / z + 1.0 / zs)
         elif et == "line":
             th = _theta(seg, f)
-            zl = line_input(z, seg["z0"], th) if kind == "series" else None
             if kind == "series":
-                z = zl
+                z = line_input(z, seg["z0"], th)
             else:
                 ys = stub_admittance(seg["z0"], th, seg.get("termin", "open"))
                 z = 1.0 / (1.0 / z + ys)
@@ -130,62 +133,65 @@ def evaluate(freq, zload, segments, z0, power=1.0):
     mismatch_db = -10.0 * np.log10(np.maximum(1.0 - mag ** 2, 1e-15))
 
     # ---- forward voltage/current sweep, Thevenin source Vth=2 sqrt(P Z0) --
+    # Vth and Zs are RMS phasors: available power P = |Vth|^2/(4 Z0).
     vth = 2.0 * math.sqrt(max(power, 0.0) * z0)
-    v = vth * zin / (z0 + zin)
+    i_in = vth / (z0 + zin)
+    v_in = vth - z0 * i_in
+    vline, iline = v_in, i_in  # node voltage / line current so far
+
     comps = {}
     p_diss = np.zeros_like(f)
 
-    for seg, zb in zip(segments, before):
+    for i, seg in enumerate(segments):
         cid = seg["id"]
         kind, et = seg["kind"], seg["etype"]
-        q = seg.get("q", 0.0) or 0.0
+        za = z_after[i]
         if et in ("L", "C"):
             zs = _seg_impedance(seg, w)
             if kind == "series":
-                i_line = v / zb
-                vcomp = i_line * zs
-                v_after = v - vcomp
+                vcomp = iline * zs
                 vrms = np.abs(vcomp)
-                irms = np.abs(i_line)
-                pd = irms ** 2 * (zs.real if q else 0.0)
-                v = v_after
+                irms = np.abs(iline)
+                pd = irms ** 2 * zs.real
+                vline = vline - vcomp
             else:
-                ys = 1.0 / zs
-                ish = v * ys
-                vrms = np.abs(v)
+                vsh = iline * za  # voltage at the shunt node
+                ish = vsh / zs
+                vrms = np.abs(vsh)
                 irms = np.abs(ish)
-                if q:
-                    rp = q * max(abs(zs.imag), 1e-12)  # parallel equivalent
-                    pd = vrms ** 2 / rp
-                else:
-                    pd = np.zeros_like(f)
-        else:  # line
+                pd = vrms ** 2 / (
+                    (seg.get("q", 0.0) or 0.0) *
+                    np.maximum(np.abs(zs.imag), 1e-12)
+                ) if seg.get("q", 0.0) else np.zeros_like(f)
+                iline = iline - ish
+                vline = vsh
+        else:  # lossless line / stub
             th = _theta(seg, f)
             if kind == "series":
-                # ABCD: V_before = V_after (cosθ + j Z0 sinθ / Z_after)
-                z_after = line_input_inv(zb, seg["z0"], th)
-                denom = np.cos(th) + 1j * seg["z0"] * np.sin(th) / z_after
-                v_after = v / denom
-                # standing-wave maxima on the lossless segment
-                gl = (z_after - seg["z0"]) / (z_after + seg["z0"])
-                vplus = np.abs(v_after / (1.0 + gl))
+                # ABCD: V_in = V_out (cosθ + j Z0 sinθ / Z_out)
+                denom = np.cos(th) + 1j * seg["z0"] * np.sin(th) / za
+                v_out = vline / denom
+                gl = (za - seg["z0"]) / (za + seg["z0"])
+                vplus = np.abs(v_out / (1.0 + gl))
                 rho = np.abs(gl)
-                vrms = vplus * (1.0 + rho)
-                irms = vplus / seg["z0"] * (1.0 + rho)
+                vrms = vplus * (1.0 + rho)               # SW voltage max
+                irms = vplus / seg["z0"] * (1.0 + rho)   # SW current max
                 pd = np.zeros_like(f)
-                v = v_after
+                vline, iline = v_out, v_out / za
             else:
+                vsh = iline * za
                 ys = stub_admittance(seg["z0"], th, seg.get("termin", "open"))
-                ish = v * ys
-                vrms = np.abs(v)
+                ish = vsh * ys
+                vrms = np.abs(vsh)
                 irms = np.abs(ish)
                 pd = np.zeros_like(f)
+                iline = iline - ish
+                vline = vsh
         p_diss = p_diss + pd
         comps[cid] = {"v": vrms, "i": irms, "p": pd}
 
     # power entering the network (RMS phasor convention: P = Re(V I*))
-    i_in = vth / (z0 + zin)
-    p_in = np.real(v * np.conj(i_in))
+    p_in = np.real(v_in * np.conj(i_in))
     p_load = np.maximum(p_in - p_diss, 1e-30)
     eta = np.clip(p_load / np.maximum(p_in, 1e-30), 0.0, 1.0)
     diss_db = -10.0 * np.log10(np.maximum(eta, 1e-12))

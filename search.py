@@ -42,54 +42,61 @@ def topologies():
     L, P, T, S = [], [], [], []
 
     # ---- L networks: one series + one shunt, both placements ----
+    # pos: position from source (0 = source-adjacent, 1 = load-adjacent)
     for series_near in ("source", "load"):
         for et_series in ("L", "C"):
             for et_shunt in ("L", "C"):
                 code = f"L-{series_near[0]}-{et_series}{et_shunt}"
+                s_pos = 0 if series_near == "source" else 1
+                p_pos = 1 - s_pos
                 params = [
                     dict(id="s1", kind="series", etype=et_series,
-                         place=series_near, ptype="x"),
+                         place=series_near, ptype="x", pos=s_pos),
                     dict(id="p1", kind="shunt", etype=et_shunt,
                          place="load" if series_near == "source" else "source",
-                         ptype="x"),
+                         ptype="x", pos=p_pos),
                 ]
                 name = f"L: 串{et_series}+并{et_shunt} (串在{'源' if series_near=='source' else '负载'}侧)"
                 L.append(dict(code=code, name=name, family="L", params=params))
 
-    # ---- Pi: shunt-series-shunt ----
+    # ---- Pi: shunt-series-shunt (source -> load) ----
     for p1 in ("L", "C"):
         for s2 in ("L", "C"):
             for p3 in ("L", "C"):
                 code = f"Pi-{p1}{s2}{p3}"
                 params = [
-                    dict(id="p1", kind="shunt", etype=p1, ptype="x"),
-                    dict(id="s2", kind="series", etype=s2, ptype="x"),
-                    dict(id="p3", kind="shunt", etype=p3, ptype="x"),
+                    dict(id="p1", kind="shunt", etype=p1, ptype="x", pos=0,
+                         place="source"),
+                    dict(id="s2", kind="series", etype=s2, ptype="x", pos=1),
+                    dict(id="p3", kind="shunt", etype=p3, ptype="x", pos=2,
+                         place="load"),
                 ]
                 name = f"Π: 并{p1}-串{s2}-并{p3}"
                 P.append(dict(code=code, name=name, family="Pi", params=params))
 
-    # ---- T: series-shunt-series ----
+    # ---- T: series-shunt-series (source -> load) ----
     for s1 in ("L", "C"):
         for p2 in ("L", "C"):
             for s3 in ("L", "C"):
                 code = f"T-{s1}{p2}{s3}"
                 params = [
-                    dict(id="s1", kind="series", etype=s1, ptype="x"),
-                    dict(id="p2", kind="shunt", etype=p2, ptype="x"),
-                    dict(id="s3", kind="series", etype=s3, ptype="x"),
+                    dict(id="s1", kind="series", etype=s1, ptype="x", pos=0,
+                         place="source"),
+                    dict(id="p2", kind="shunt", etype=p2, ptype="x", pos=1),
+                    dict(id="s3", kind="series", etype=s3, ptype="x", pos=2,
+                         place="load"),
                 ]
                 name = f"T: 串{s1}-并{p2}-串{s3}"
                 T.append(dict(code=code, name=name, family="T", params=params))
 
-    # ---- single-stub tuners ----
+    # ---- single-stub tuners: series line, then shunt stub at load ----
     for termin in ("open", "short"):
         code = f"Stb-{termin}"
         params = [
             dict(id="s1", kind="series", etype="line", ptype="th",
-                 z0="zline", vf=1.0),
+                 z0="zline", vf=1.0, pos=0, place="source"),
             dict(id="p1", kind="shunt", etype="line", ptype="th",
-                 z0="zstub", vf=1.0, termin=termin),
+                 z0="zstub", vf=1.0, termin=termin, pos=1, place="load"),
         ]
         zh = "开路" if termin == "open" else "短路"
         name = f"短截线: {zh}短截线 (串线段+并短截线)"
@@ -135,11 +142,9 @@ def _make_segment(spec, x, f0, z0, setup):
 
 def _segments_from_x(xs, cfg, f0, z0, setup, limits):
     segs = []
-    # order source -> load using the param "place" hint
-    ordered = sorted(zip(cfg["params"], xs),
-                     key=lambda kv: 0 if kv[0].get("place", "source") == "source"
-                     else 1)
-    for spec, x in ordered:
+    # emit segments in source -> load order (param "pos")
+    pairs = sorted(zip(cfg["params"], xs), key=lambda kv: kv[0].get("pos", 0))
+    for spec, x in pairs:
         segs.append(_make_segment(spec, float(x), f0, z0, setup))
     return segs
 
@@ -150,12 +155,13 @@ def _segments_from_x(xs, cfg, f0, z0, setup, limits):
 
 def _zin_scalar(xs, cfg, f0, zl0, z0, setup):
     z = complex(zl0)
-    ordered = sorted(zip(cfg["params"], xs),
-                     key=lambda kv: 0 if kv[0].get("place", "source") == "source"
-                     else 1)
-    for spec, x in ordered:
+    # start from the load (largest pos) and fold elements toward source
+    pairs = sorted(zip(cfg["params"], xs),
+                   key=lambda kv: -kv[0].get("pos", 0))
+    for spec, x in pairs:
         if spec["ptype"] == "x":
-            zs = x * z0
+            # signed normalised reactance: +1 at f0 means X = +Z0 (j Z0)
+            zs = 1j * x * z0
             if spec["kind"] == "series":
                 z = z + zs
             else:
@@ -213,26 +219,29 @@ def solve_l_analytic(cfg, f0, zl0, z0, setup, limits):
     out = []
 
     if shunt.get("place") == "source":
-        # shunt admittance jb at source, then series jx to the load
-        y = 1.0 / complex(zl0)
+        # topology (source) -- shunt jb -- series jx -- load (R+jX)
+        # z1 = R + j(X+x), require Re(1/z1) = 1/Z0 and Im(1/z1) = -b.
+        val = z0 / R - 1.0
+        if val >= 0:
+            for s in (1.0, -1.0):
+                x_plus_x = s * R * math.sqrt(val)
+                x = x_plus_x - X
+                b = -(1.0 / complex(R, x_plus_x)).imag
+                vec = _l_vec(cfg, series, shunt, x, b, f0, z0, limits)
+                if vec is not None:
+                    out.append(vec)
+    else:
+        # topology (source) -- series jx -- node [shunt jb] -- load (R+jX)
+        # z_par = 1/(y + jb), y = 1/(R+jX); require Re(z_par) = Z0,
+        # then the series element cancels Im(z_par).
+        y = 1.0 / complex(R, X)
         gr, bi = y.real, y.imag
         val = gr / z0 - gr ** 2
         if val >= 0:
             for s in (1.0, -1.0):
                 b = -bi + s * math.sqrt(val)
-                zsh = 1.0 / (1.0 / complex(zl0) + 1j * b)
-                x = -zsh.imag
-                vec = _l_vec(cfg, series, shunt, x, b, f0, z0, limits)
-                if vec is not None:
-                    out.append(vec)
-    else:
-        # series jx adjacent to load, shunt jb at source node
-        val = z0 / R - 1.0
-        if val >= 0:
-            for s in (1.0, -1.0):
-                q = s * math.sqrt(val)
-                x = q * z0 - X
-                b = -q / (z0 * (1.0 + q ** 2))
+                z_par = 1.0 / complex(gr, bi + b)
+                x = -z_par.imag
                 vec = _l_vec(cfg, series, shunt, x, b, f0, z0, limits)
                 if vec is not None:
                     out.append(vec)
@@ -360,7 +369,7 @@ def _run_lsq(x0, cfg, f0, zl0, z0, setup, bounds, specs, fixed_k=None,
                               max_nfev=300)
         except Exception:
             return None
-        if r.cost > 0.5 * (1e-3 ** 2):
+        if r.cost > 0.5 * (1e-7 ** 2):
             return None
         return r.x
 
@@ -382,7 +391,7 @@ def _run_lsq(x0, cfg, f0, zl0, z0, setup, bounds, specs, fixed_k=None,
                           max_nfev=200)
     except Exception:
         return None
-    if r.cost > 0.5 * (1e-3 ** 2):
+    if r.cost > 0.5 * (1e-7 ** 2):
         return None
     x = np.zeros(len(specs))
     x[fixed_k] = fixed_v
@@ -445,8 +454,15 @@ def search_candidates(data):
     z_at = feedline_input(zl, f, setup["zline"], setup["line_len"],
                           setup["vf"], setup.get("line_loss", 0.0))
 
-    # interpolated dense grid over a slightly wider span for bandwidth
-    fd = np.linspace(min(f.min(), flow) , max(f.max(), fhigh), 401)
+    # dense grid for bandwidth/stress; force f0 onto the grid so the exact
+    # match point is represented, and cover a margin beyond the band
+    fspan = max(fhigh - flow, 0.05 * f0)
+    f_lo = min(f.min(), flow - 0.15 * fspan)
+    f_hi = max(f.max(), fhigh + 0.15 * fspan)
+    ngrid = 400
+    fd = np.linspace(f_lo, f_hi, ngrid)
+    j0 = int(round((f0 - f_lo) / (f_hi - f_lo) * (ngrid - 1)))
+    fd[j0] = f0
     zd = np.interp(fd, f, z_at.real) + 1j * np.interp(fd, f, z_at.imag)
     in_band = (fd >= flow) & (fd <= fhigh)
 
@@ -472,8 +488,13 @@ def search_candidates(data):
 
             for xs in sols:
                 segs = _segments_from_x(xs, cfg, f0, z0, setup, limits)
+                # hard acceptance: the network must actually match at f0,
+                # guarding against weakly-converged numerical solutions
+                zchk = _zin_scalar(xs, cfg, f0, z0f, z0, setup)
+                gchk = abs((zchk - z0) / (zchk + z0))
+                if gchk > 1e-4:  # SWR ~1.0002
+                    continue
                 res_d = evaluate(fd, zd, segs, z0, power=power)
-                res_f = evaluate(f, z_at, segs, z0, power=power)
 
                 # all values/limits must be physical (already bounded);
                 # gather metrics over band
@@ -529,7 +550,8 @@ def search_candidates(data):
                 # flags
                 flags = []
                 if over:
-                    fb = f[np.argmax(res_f["swr"])]
+                    f_in = fd[in_band]
+                    fb = f_in[np.argmax(res_d["swr"][in_band])]
                     flags.append(dict(kind="overrating",
                                       msg=f"元件越额: {', '.join(over)}",
                                       freq=float(fb)))
@@ -577,14 +599,14 @@ def search_candidates(data):
                         d["termin"] = seg.get("termin")
                     comps_out.append(d)
 
-                # per-frequency traces at the imported frequencies
+                # per-frequency traces on the dense grid (contains f0)
                 traces = dict(
-                    f=[float(x) for x in f],
+                    f=[float(x) for x in fd],
                     zin=[[float(z.real), float(z.imag)]
-                         for z in res_f["zin"]],
-                    swr=[float(x) for x in res_f["swr"]],
-                    rl=[float(x) for x in res_f["rl"]],
-                    loss=[float(x) for x in res_f["loss_db"]],
+                         for z in res_d["zin"]],
+                    swr=[float(x) for x in res_d["swr"]],
+                    rl=[float(x) for x in res_d["rl"]],
+                    loss=[float(x) for x in res_d["loss_db"]],
                 )
 
                 cands.append(dict(
