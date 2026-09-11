@@ -22,6 +22,7 @@
     dials: null,    // {id: [v0 ... v1]}
     steps: [],      // 轨道步骤（含 action/values/metrics/violations/risk）
     sel: -1,
+    verified: false, // 最近一次规划/复算通过且到达目标，才允许保存
   };
 
   const esc = s => String(s).replace(/[&<>"]/g, c =>
@@ -75,6 +76,7 @@
     const info = $("tunePairInfo");
     const fk = $("tuneFrom").value, tk = $("tuneTo").value;
     T.pair = null;
+    T.verified = false;
     buildStepInputs();
     if (!fk || !tk) {
       info.textContent = "选择拓扑与元件编号一致的两个方案";
@@ -205,6 +207,7 @@
     const d = await post("/api/tune/plan", body);
     const dt = ((performance.now() - t0) / 1000).toFixed(1);
     if (d.error && !d.steps) {
+      T.verified = false;
       $("tuneInfo").textContent = d.error;
       if (d.stuck) showStuck(d);
       return;
@@ -217,6 +220,7 @@
     const nPrefix = prefix ? prefix.length : 0;
     T.steps = (d.steps || []).map((s, i) =>
       Object.assign(s, { pinned: i < nPrefix }));
+    T.verified = !!d.ok;
     if (d.ok) {
       $("tuneInfo").textContent =
         `找到 ${d.steps.length} 步安全路径（访问 ${d.states} 个状态，${dt} s）`;
@@ -230,7 +234,8 @@
     }
   }
 
-  // 复算当前序列（调整先后 / 插入功率节点 / 修改上限后）
+  // 复算当前序列（调整先后 / 插入功率节点 / 修改上限后）：
+  // 除逐步安全上限外，后端同时核对最终旋钮值是否到达目标方案
   async function doRecheck() {
     if (!T.pair || !T.steps.length) { toast("没有可复算的序列"); return; }
     const form = readTuneForm();
@@ -239,19 +244,35 @@
     const pins = T.steps.map(s => !!s.pinned);
     const body = Object.assign(basePayload(), {
       start: T.pair.from.values,
+      target: T.pair.to.values,
       actions: T.steps.map(s => s.action),
       power: T.power, limits: T.limits,
       dials: T.dials || undefined,
     });
     $("tuneInfo").textContent = "复算中…";
     const d = await post("/api/tune/check", body);
-    if (d.error) { $("tuneInfo").textContent = d.error; return; }
+    if (d.error) {
+      T.verified = false;
+      $("tuneInfo").textContent = d.error;
+      return;
+    }
     T.steps = d.steps.map((s, i) =>
       Object.assign(s, { pinned: pins[i] || false }));
     if (T.sel >= T.steps.length) T.sel = T.steps.length - 1;
-    $("tuneInfo").textContent = d.ok
-      ? "复算通过：全程未超限"
-      : "复算完成：存在超限步骤（红色）";
+    T.verified = !!(d.ok && d.reached_target !== false);
+    if (d.ok) {
+      $("tuneInfo").textContent = "复算通过：全程未超限，已到达目标";
+    } else if (d.reached_target === false) {
+      const mm = (d.mismatch || []).map(m => {
+        const seg = T.pair.segsById[m.id];
+        return `${compLabel(m.id)} 目标 ${fmtV(m.expected, seg)}，` +
+          `实际 ${fmtV(m.actual, seg)}`;
+      }).join("；");
+      $("tuneInfo").textContent =
+        "复算失败：最终旋钮值未到达目标方案 — " + mm;
+    } else {
+      $("tuneInfo").textContent = "复算完成：存在超限步骤（红色）";
+    }
     renderTrack();
   }
 
@@ -429,6 +450,7 @@
     T.steps[i] = T.steps[j];
     T.steps[j] = t;
     T.sel = j;
+    T.verified = false;   // 顺序已变，需复算确认安全且到达目标
     doRecheck();
   }
 
@@ -442,6 +464,7 @@
       action: { type: "power", power: p }, pinned: false,
     });
     T.sel = i;
+    T.verified = false;
     doRecheck();
   }
 
@@ -449,6 +472,7 @@
     if (T.steps[i].pinned) return;
     T.steps.splice(i, 1);
     if (T.sel >= T.steps.length) T.sel = T.steps.length - 1;
+    T.verified = false;
     doRecheck();
   }
 
@@ -492,6 +516,10 @@
   // ------------------------------------------------------------ 保存/载入
   async function savePath() {
     if (!T.steps.length) { toast("没有可保存的路径"); return; }
+    if (!T.verified) {
+      toast("序列未通过复算或未到达目标方案，不能保存");
+      return;
+    }
     if (!T.pair || !T.pair.to.vid) {
       toast("目标方案需为已存版本——路径仅关联到目标方案，不改动原方案");
       return;
@@ -595,6 +623,7 @@
     T.steps = (d.steps || []).map(s =>
       Object.assign({ metrics: { comps: {} } }, s, { pinned: false }));
     T.sel = T.steps.length ? 0 : -1;
+    T.verified = true;   // 保存时即已校验通过并到达目标
     $("tunePower").value = T.power;
     if (T.limits.swr) $("tuneSwr").value = T.limits.swr;
     if (T.limits.v) $("tuneV").value = T.limits.v;

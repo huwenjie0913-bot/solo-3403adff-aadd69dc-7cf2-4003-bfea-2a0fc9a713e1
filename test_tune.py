@@ -11,7 +11,8 @@ from unittest import mock
 import numpy as np
 
 import tune
-from tune import build_dials, check_actions, make_context, plan
+from tune import (build_dials, check_actions, make_context, plan,
+                  target_mismatch)
 
 
 def _ctx(power=10.0, limits=None, ngrid=151):
@@ -93,6 +94,40 @@ class TestPlan(unittest.TestCase):
         multi = [s for s in steps if len(s["action"]["changes"]) == 2]
         self.assertEqual(len(multi), 4)  # every move turns both knobs
         self.assertAlmostEqual(steps[-1]["values"]["p1"], TARGET["p1"])
+
+    def test_linked_group_keeps_single_knob_moves(self):
+        """允许联动只是额外选项：组内旋钮必须仍能单独动作。
+
+        构造一堵"对角墙"：两个旋钮同步走到相同刻度的中间状态不安全，
+        从起点出发的联动动作受阻；若联动成员只能同动（旧行为）则误报
+        无路，保留单独动作时应能找到含单旋钮步的混合路径。
+        """
+        ctx = _ctx()
+        real = tune.state_metrics
+
+        def diagonal_wall(c, values, power=None):
+            m = real(c, values, power)
+            ip = round((values["p1"] - 760e-12) / 28.02e-12)
+            is_ = round((values["s1"] - 3.3e-6) / 1.01575e-7)
+            if ip == is_ and 0 < ip < 4:
+                m["violations"] = [{"metric": "swr", "comp": None,
+                                    "value": 3.5, "limit": 3.0,
+                                    "freq": 3.5e6}]
+            return m
+
+        with mock.patch.object(tune, "state_metrics",
+                               side_effect=diagonal_wall):
+            res = plan(ctx, CURRENT, TARGET, STEPS, links=[["p1", "s1"]])
+        self.assertTrue(res["ok"], res.get("error"))
+        steps = res["steps"]
+        # 关键：路径中包含联动组成员的单独动作（旧行为下整局无路）
+        self.assertTrue(any(len(s["action"]["changes"]) == 1
+                            for s in steps))
+        # 终点精确到达目标
+        self.assertAlmostEqual(steps[-1]["values"]["p1"], TARGET["p1"])
+        self.assertAlmostEqual(steps[-1]["values"]["s1"], TARGET["s1"])
+        # 每一步都安全
+        self.assertTrue(all(not s["violations"] for s in steps))
 
     def test_start_unsafe_reported(self):
         ctx = _ctx(limits={"swr": 1.0, "v": 1e9, "i": 1e9, "loss": 1e9})
@@ -188,6 +223,25 @@ class TestCheck(unittest.TestCase):
         self.assertEqual(steps[0]["dials"]["s1"], [0, 4])
 
 
+class TestTargetMismatch(unittest.TestCase):
+    def test_exact_target_reached(self):
+        self.assertEqual(
+            target_mismatch(TARGET, TARGET, ["p1", "s1"]), [])
+
+    def test_deleted_step_leaves_mismatch(self):
+        # 少转一格：p1 停在第 3 刻度而非目标
+        final = {"p1": 844.06e-12, "s1": TARGET["s1"]}
+        mm = target_mismatch(final, TARGET, ["p1", "s1"])
+        self.assertEqual(len(mm), 1)
+        self.assertEqual(mm[0]["id"], "p1")
+        self.assertAlmostEqual(mm[0]["expected"], TARGET["p1"])
+        self.assertAlmostEqual(mm[0]["actual"], 844.06e-12)
+
+    def test_extra_component_in_target_is_ignored(self):
+        tgt = dict(TARGET, extra=1.0)
+        self.assertEqual(target_mismatch(TARGET, tgt, ["p1", "s1"]), [])
+
+
 class TestApi(unittest.TestCase):
     """Flask endpoints with a temporary SQLite database."""
 
@@ -237,16 +291,18 @@ class TestApi(unittest.TestCase):
         self.assertTrue(plan_res["ok"], plan_res.get("error"))
         self.assertEqual(len(plan_res["steps"]), 8)
 
-        # check endpoint with an inserted power node
+        # check endpoint with an inserted power node (target included)
         actions = ([plan_res["steps"][0]["action"],
                     {"type": "power", "power": 5.0}] +
                    [s["action"] for s in plan_res["steps"][1:]])
         r = c.post("/api/tune/check", json=dict(
             self._payload(), start=CURRENT, actions=actions, power=10.0,
+            target=TARGET,
             limits={"swr": 3.0, "v": 500.0, "i": 5.0, "loss": 6.0},
             dials=plan_res["dials"]))
         chk = r.get_json()
         self.assertTrue(chk["ok"])
+        self.assertTrue(chk["reached_target"])
         self.assertEqual(chk["steps"][1]["power"], 5.0)
 
         # save a version (target) and a path linked to it
@@ -276,6 +332,58 @@ class TestApi(unittest.TestCase):
         r = self.client.post("/api/tune/paths", json={
             "name": "x", "data": {}})
         self.assertEqual(r.status_code, 400)
+
+    def test_check_fails_when_target_not_reached(self):
+        """删除一步后复算：虽未超限，但最终值未达目标 -> ok=False。"""
+        c = self.client
+        body = self._payload()
+        body.update({
+            "current": CURRENT, "target": TARGET, "steps": STEPS,
+            "links": [], "power": 10.0,
+            "limits": {"swr": 3.0, "v": 500.0, "i": 5.0, "loss": 6.0},
+        })
+        plan_res = c.post("/api/tune/plan", json=body).get_json()
+        self.assertTrue(plan_res["ok"])
+        actions = [s["action"] for s in plan_res["steps"]]
+
+        # 完整序列：到达目标
+        r = c.post("/api/tune/check", json=dict(
+            self._payload(), start=CURRENT, target=TARGET,
+            actions=actions, power=10.0,
+            limits={"swr": 3.0, "v": 500.0, "i": 5.0, "loss": 6.0}))
+        full = r.get_json()
+        self.assertTrue(full["ok"])
+        self.assertTrue(full["reached_target"])
+
+        # 删掉最后一步：安全但未到达目标 -> 必须失败
+        r = c.post("/api/tune/check", json=dict(
+            self._payload(), start=CURRENT, target=TARGET,
+            actions=actions[:-1], power=10.0,
+            limits={"swr": 3.0, "v": 500.0, "i": 5.0, "loss": 6.0}))
+        short = r.get_json()
+        self.assertFalse(short["ok"])
+        self.assertFalse(short["reached_target"])
+        self.assertEqual(len(short["mismatch"]), 1)
+        self.assertIn(short["mismatch"][0]["id"], ("p1", "s1"))
+        self.assertAlmostEqual(
+            short["mismatch"][0]["expected"],
+            TARGET[short["mismatch"][0]["id"]])
+        # 逐步安全校核仍然返回
+        self.assertEqual(len(short["steps"]), len(actions) - 1)
+        self.assertFalse(any(s["violations"] for s in short["steps"]))
+
+    def test_check_violation_and_target_flags_are_independent(self):
+        """超限但到达目标：ok=False 而 reached_target=True。"""
+        c = self.client
+        actions = [{"type": "set", "changes": dict(TARGET)}]
+        r = c.post("/api/tune/check", json=dict(
+            self._payload(), start=CURRENT, target=TARGET,
+            actions=actions, power=10.0,
+            limits={"swr": 1.0, "v": 1e9, "i": 1e9, "loss": 1e9}))
+        d = r.get_json()
+        self.assertFalse(d["ok"])            # 有超限
+        self.assertTrue(d["reached_target"])  # 但确实到达目标
+        self.assertTrue(d["steps"][0]["violations"])
 
     def test_plan_rejects_bad_step(self):
         body = self._payload()

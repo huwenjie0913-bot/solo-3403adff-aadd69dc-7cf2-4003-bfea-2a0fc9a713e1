@@ -171,6 +171,22 @@ def _nearest_idx(arr, v):
     return int(np.argmin(np.abs(np.asarray(arr, dtype=float) - float(v))))
 
 
+def target_mismatch(final, target, ids, rel=1e-9):
+    """最终旋钮值与目标方案的差异列表；空列表表示已到达目标。
+
+    容差按目标值相对取值（下限 1e-15，覆盖 H/F/m 的小量纲），
+    一个步进以上的偏差必然被检出。
+    """
+    out = []
+    for cid in ids:
+        if cid not in target:
+            continue
+        t, a = float(target[cid]), float(final[cid])
+        if abs(a - t) > rel * max(abs(t), 1e-15):
+            out.append({"id": cid, "expected": t, "actual": a})
+    return out
+
+
 def _dial_reading(dials, ids, idx):
     return {cid: [int(k), len(dials[cid]) - 1] for cid, k in zip(ids, idx)}
 
@@ -227,7 +243,8 @@ def plan(ctx, current, target, steps_def, links=None, prefix=None,
          max_states=40000):
     """从 current 到 target 的安全调谐序列。
 
-    links: 允许联动的旋钮组 [[id, id, ...], ...]；同组一次动作一起转。
+    links: 允许联动的旋钮组 [[id, id, ...], ...]；同组一次动作一起转，
+           但组内旋钮的单独动作始终保留（联动只是额外选项）。
     prefix: 已固定（📌）的动作前缀，先执行并校核，再自动规划余下部分。
     """
     ids = ctx["ids"]
@@ -270,15 +287,15 @@ def plan(ctx, current, target, steps_def, links=None, prefix=None,
                 "error": "目标状态在调谐功率下超限，请降低功率或放宽上限",
                 "metrics": mg, "dials": dials, "steps": prefix_steps}
 
-    # ---- 动作组：联动组 + 单旋钮 ----
-    used, groups = set(), []
+    # ---- 动作组：联动组是额外选项，各旋钮的单独动作始终保留 ----
+    # （安全路径若需要先单独调节组内某旋钮，联动不应把它排除掉）
+    groups, seen = [], set()
     for grp in (links or []):
-        members = tuple(sorted({ids.index(c) for c in grp if c in ids}
-                               - used))
-        if len(members) >= 2:
+        members = tuple(sorted({ids.index(c) for c in grp if c in ids}))
+        if len(members) >= 2 and members not in seen:
             groups.append(members)
-            used.update(members)
-    groups += [(i,) for i in range(len(ids)) if i not in used]
+            seen.add(members)
+    groups += [(i,) for i in range(len(ids))]
     max_group = max((len(g) for g in groups), default=1)
 
     def moves(idx):

@@ -250,7 +250,18 @@ def api_tune_check():
             ctx, d["start"], d.get("actions") or [],
             dials=d.get("dials"))
         ok = not any(s["violations"] for s in steps)
-        return jsonify({"ok": ok, "steps": steps, "final_values": final})
+        resp = {"steps": steps, "final_values": final}
+        # 除逐步安全上限外，还必须核对最终旋钮值到达目标方案
+        if d.get("target") is not None:
+            mism = tunemod.target_mismatch(final, d["target"], ctx["ids"])
+            resp["reached_target"] = not mism
+            if mism:
+                resp["mismatch"] = mism
+                ok = False
+        else:
+            resp["reached_target"] = None
+        resp["ok"] = ok
+        return jsonify(resp)
     except (KeyError, ValueError) as e:
         return jsonify({"error": f"参数错误: {e}"}), 400
     except Exception as e:  # noqa: BLE001
